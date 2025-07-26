@@ -1,8 +1,6 @@
 // ===================================================
 //              IMPORTS DAS BIBLIOTECAS
 // ===================================================
-
-// Importações do Baileys, incluindo os tipos necessários
 import makeWASocket, {
     DisconnectReason,
     fetchLatestBaileysVersion,
@@ -14,167 +12,160 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import pino from 'pino'
-
-// Importações do Servidor Web e de Tempo Real
 import express, { Request, Response } from 'express'
 import http from 'http'
 import { Server, Socket } from 'socket.io'
-import qrcode from 'qrcode-terminal'
-
+import { Storage } from '@google-cloud/storage' // NOVO: Importa o GCS
+import fs from 'fs/promises'
+import path from 'path'
 
 // ===================================================
-//         CONFIGURAÇÃO DO SERVIDOR WEB E SOCKET.IO
+//         CONFIGURAÇÃO DO SERVIDOR E GCS
 // ===================================================
-
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*", // Em produção, restrinja para o domínio do seu frontend: "http://meufrontend.com"
-    }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 app.use(express.json());
 
+// --- Configuração do Google Cloud Storage ---
+const storage = new Storage();
+const bucketName = 'substitua-pelo-nome-do-seu-bucket'; // <<< IMPORTANTE: COLOQUE O NOME DO SEU BUCKET AQUI
+const bucket = storage.bucket(bucketName);
+const authDir = './auth_info_baileys'; // Diretório local temporário
 
 // ===================================================
 //         VARIÁVEIS DE ESTADO GLOBAIS
 // ===================================================
-
 let sock: WASocket;
 let qrCode: string | undefined;
 let connectionStatus: ConnectionState['connection'] = 'connecting';
 
+// ===================================================
+//         FUNÇÃO DE AUTENTICAÇÃO COM GCS
+// ===================================================
+async function getAuthStateFromGCS() {
+    try {
+        await fs.mkdir(authDir, { recursive: true });
+        const [files] = await bucket.getFiles();
+        console.log(`[GCS] Baixando ${files.length} arquivos de sessão...`);
+        for (const file of files) {
+            const localPath = path.join(authDir, file.name);
+            await file.download({ destination: localPath });
+        }
+    } catch (error) {
+        console.log('[GCS] Nenhuma sessão encontrada ou falha ao baixar. Iniciando nova sessão.');
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    return {
+        state,
+        saveCreds: async () => {
+            await saveCreds(); // Salva localmente primeiro
+            try {
+                const filesInDir = await fs.readdir(authDir);
+                for (const fileName of filesInDir) {
+                    const filePath = path.join(authDir, fileName);
+                    await bucket.upload(filePath);
+                }
+                console.log('[GCS] Sessão sincronizada com o Google Cloud Storage.');
+            } catch (error) {
+                console.error('[GCS] Falha ao sincronizar sessão:', error);
+            }
+        }
+    };
+}
+
 
 // ===================================================
-//         FUNÇÃO PRINCIPAL DE CONEXÃO COM O WHATSAPP
+//         FUNÇÃO PRINCIPAL DE CONEXÃO
 // ===================================================
-
 async function connectToWhatsApp() {
-    // Gerencia a autenticação, salvando a sessão em arquivos
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    // ALTERADO: Usa a nova função de autenticação
+    const { state, saveCreds } = await getAuthStateFromGCS();
     
-    // Busca a versão mais recente do WhatsApp Web para garantir compatibilidade
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`[VERSÃO] Usando a versão do WhatsApp: ${version.join('.')}, é a mais recente: ${isLatest}`);
 
-    // Cria a instância do socket do Baileys
     sock = makeWASocket({
         version,
         auth: state,
-        logger: pino({ level: 'silent' }), // Use 'debug' para ver todos os logs do Baileys
-        printQRInTerminal: true, // Gera o QR Code no terminal automaticamente
-        browser: ['Ótica System', 'Chrome', '1.0.0'] // Simula um navegador para mais segurança
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: true,
+        browser: ['Ótica System', 'Chrome', '1.0.0']
     });
 
-    // ----- LISTENERS DE EVENTOS DO BAILEYS -----
-
-    // Monitora o status da conexão
+    // O resto do seu código de listeners continua igual...
     sock.ev.on('connection.update', (update: Partial<ConnectionState>) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (connection) {
-            connectionStatus = connection;
-        }
-
+        if (connection) { connectionStatus = connection; }
         if (qr) {
             qrCode = qr;
             console.log('QR Code gerado, escaneie por favor.');
-            // Emite o QR Code para o frontend via Socket.io
             io.emit('qr', qrCode);
         }
-
         if (connection === 'close') {
             const lastError = lastDisconnect?.error as Boom | undefined;
             const statusCode = lastError?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
             console.log(`[CONEXÃO] Fechada: ${statusCode}`, ', reconectando:', shouldReconnect);
-
             if (shouldReconnect) {
-                // Tenta reconectar após 5 segundos
                 setTimeout(() => connectToWhatsApp(), 5000);
             }
         } else if (connection === 'open') {
             console.log('[CONEXÃO] WhatsApp conectado com sucesso!');
-            qrCode = undefined; // Limpa o QR Code após a conexão
+            qrCode = undefined;
         }
-        
-        // Emite o status atual da conexão para todos os clientes do frontend
         io.emit('connectionUpdate', { status: connectionStatus });
     });
 
-    // Salva as credenciais sempre que forem atualizadas
+    // ALTERADO: Usa a função saveCreds que sincroniza com o GCS
     sock.ev.on('creds.update', saveCreds);
 
-    // Ouve por novas mensagens
     sock.ev.on('messages.upsert', (m: { messages: WAMessage[], type: MessageUpsertType }) => {
         const receivedMessage = m.messages[0];
         if (receivedMessage) {
             console.log(`[MENSAGEM] Recebida de ${receivedMessage.key.remoteJid}`);
-            // Emite a mensagem completa para o frontend
             io.emit('newMessage', receivedMessage);
         }
     });
 }
 
-
-// ===================================================
-//         ROTAS DA API (PARA O FRONTEND CHAMAR)
-// ===================================================
-
+// O resto do seu código de API e Socket.io continua igual...
 app.get('/status', (req: Request, res: Response) => {
-    res.status(200).json({ 
-        status: connectionStatus, 
-        qr: qrCode 
-    });
+    res.status(200).json({ status: connectionStatus, qr: qrCode });
 });
-
 app.post('/messages/send', async (req: Request, res: Response) => {
     const { number, message } = req.body;
-
     if (connectionStatus !== 'open' || !sock) {
-        return res.status(503).json({ success: false, error: 'Serviço indisponível. WhatsApp não está conectado.' });
+        return res.status(503).json({ success: false, error: 'Serviço indisponível.' });
     }
     if (!number || !message) {
-        return res.status(400).json({ success: false, error: 'O número (number) e a mensagem (message) são obrigatórios.' });
+        return res.status(400).json({ success: false, error: 'Número e mensagem são obrigatórios.' });
     }
-
     try {
         const formattedNumber = `${number}@s.whatsapp.net`;
         await sock.sendMessage(formattedNumber, { text: message });
-        res.status(200).json({ success: true, message: 'Mensagem enviada com sucesso.' });
+        res.status(200).json({ success: true, message: 'Mensagem enviada.' });
     } catch (error) {
         console.error("[API ERROR] Falha ao enviar mensagem:", error);
-        res.status(500).json({ success: false, error: 'Falha interna ao enviar mensagem.' });
+        res.status(500).json({ success: false, error: 'Falha interna.' });
     }
 });
-
-
-// ===================================================
-//         LÓGICA DO SOCKET.IO (PARA ENVIAR EVENTOS)
-// ===================================================
-
 io.on('connection', (socket: Socket) => {
     console.log(`[SOCKET.IO] Cliente conectado: ${socket.id}`);
-
-    // Envia o status atual e o QR code (se existir) assim que o cliente conecta
     socket.emit('connectionUpdate', { status: connectionStatus });
-    if (qrCode) {
-        socket.emit('qr', qrCode);
-    }
-
+    if (qrCode) { socket.emit('qr', qrCode); }
     socket.on('disconnect', () => {
         console.log(`[SOCKET.IO] Cliente desconectado: ${socket.id}`);
     });
 });
 
-
 // ===================================================
 //              INICIALIZAÇÃO DO SERVIDOR
 // ===================================================
-
 connectToWhatsApp();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Cloud Run usa a porta 8080 por padrão
 server.listen(PORT, () => {
     console.log(`[SERVIDOR] API e Socket.io rodando na porta ${PORT}`);
 });
